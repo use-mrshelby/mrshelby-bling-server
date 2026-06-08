@@ -11,17 +11,61 @@ const CLIENT_ID     = process.env.BLING_CLIENT_ID     || '473a4ea3d2c9856929dc5e
 const CLIENT_SECRET = process.env.BLING_CLIENT_SECRET || 'e36c7cdc08cc4e3ac292593c4d6cb23940314b74dfe59beadd335ef9a482';
 const BLING_BASE    = 'https://api.bling.com.br/Api/v3';
 const TOKEN_URL     = 'https://www.bling.com.br/Api/v3/oauth/token';
+const RAILWAY_TOKEN = process.env.RAILWAY_API_TOKEN || '';
+const RAILWAY_SVC   = process.env.RAILWAY_SERVICE_ID || '';
+const RAILWAY_ENV   = process.env.RAILWAY_ENVIRONMENT_ID || '';
 
 // ─── STATE DO TOKEN ───────────────────────────────────────────────────
 let tokenState = {
   accessToken:  process.env.BLING_ACCESS_TOKEN  || null,
   refreshToken: process.env.BLING_REFRESH_TOKEN || null,
-  expiresAt:    0
+  expiresAt:    process.env.BLING_TOKEN_EXPIRES ? parseInt(process.env.BLING_TOKEN_EXPIRES) : 0
 };
+
+console.log('[Init] Token salvo:', tokenState.accessToken ? 'SIM' : 'NÃO');
 
 // ─── HELPERS ──────────────────────────────────────────────────────────
 function basicAuth() {
   return 'Basic ' + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
+}
+
+// Salva tokens como variáveis de ambiente no Railway via API
+async function salvarTokensRailway(accessToken, refreshToken, expiresAt) {
+  tokenState.accessToken  = accessToken;
+  tokenState.refreshToken = refreshToken;
+  tokenState.expiresAt    = expiresAt;
+
+  if (!RAILWAY_TOKEN || !RAILWAY_SVC || !RAILWAY_ENV) {
+    console.log('[Token] Railway API não configurada — tokens salvos apenas em memória');
+    return;
+  }
+
+  try {
+    const mutation = `
+      mutation {
+        variableCollectionUpsert(input: {
+          serviceId: "${RAILWAY_SVC}"
+          environmentId: "${RAILWAY_ENV}"
+          variables: {
+            BLING_ACCESS_TOKEN: "${accessToken}"
+            BLING_REFRESH_TOKEN: "${refreshToken}"
+            BLING_TOKEN_EXPIRES: "${expiresAt}"
+          }
+        })
+      }
+    `;
+    await fetch('https://backboard.railway.app/graphql/v2', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${RAILWAY_TOKEN}`
+      },
+      body: JSON.stringify({ query: mutation })
+    });
+    console.log('[Token] Tokens salvos no Railway com sucesso');
+  } catch(e) {
+    console.error('[Token] Erro ao salvar no Railway:', e.message);
+  }
 }
 
 async function refreshToken() {
@@ -40,16 +84,15 @@ async function refreshToken() {
   });
   const data = await resp.json();
   if (!data.access_token) throw new Error('Falha ao renovar: ' + JSON.stringify(data));
-  tokenState.accessToken  = data.access_token;
-  tokenState.refreshToken = data.refresh_token;
-  tokenState.expiresAt    = Date.now() + (data.expires_in || 3600) * 1000;
-  console.log('[Token] Renovado com sucesso. Expira em:', new Date(tokenState.expiresAt).toISOString());
-  return tokenState.accessToken;
+  
+  const expiresAt = Date.now() + (data.expires_in || 3600) * 1000;
+  await salvarTokensRailway(data.access_token, data.refresh_token, expiresAt);
+  console.log('[Token] Renovado! Expira:', new Date(expiresAt).toISOString());
+  return data.access_token;
 }
 
 async function getValidToken() {
   if (!tokenState.accessToken) throw new Error('Não autenticado. Use /auth/code para autenticar.');
-  // Renova se faltar menos de 5 minutos
   if (Date.now() > tokenState.expiresAt - 300000) {
     await refreshToken();
   }
@@ -78,8 +121,6 @@ setInterval(async () => {
 }, 50 * 60 * 1000);
 
 // ─── ROTAS DE AUTH ────────────────────────────────────────────────────
-
-// Troca o code pelo access + refresh token
 app.post('/auth/code', async (req, res) => {
   const { code } = req.body;
   if (!code) return res.status(400).json({ error: 'code obrigatório' });
@@ -94,90 +135,81 @@ app.post('/auth/code', async (req, res) => {
     });
     const data = await resp.json();
     if (!data.access_token) return res.status(400).json({ error: 'Falha na autenticação', detail: data });
-    tokenState.accessToken  = data.access_token;
-    tokenState.refreshToken = data.refresh_token;
-    tokenState.expiresAt    = Date.now() + (data.expires_in || 3600) * 1000;
+
+    const expiresAt = Date.now() + (data.expires_in || 3600) * 1000;
+    await salvarTokensRailway(data.access_token, data.refresh_token, expiresAt);
     console.log('[Auth] Autenticado com sucesso!');
-    res.json({ success: true, expires_at: new Date(tokenState.expiresAt).toISOString() });
+    res.json({ success: true, expires_at: new Date(expiresAt).toISOString() });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Status da conexão
 app.get('/auth/status', (req, res) => {
   res.json({
     connected: !!tokenState.accessToken,
     expires_at: tokenState.expiresAt ? new Date(tokenState.expiresAt).toISOString() : null,
-    token_valid: tokenState.accessToken && Date.now() < tokenState.expiresAt
+    token_valid: !!(tokenState.accessToken && Date.now() < tokenState.expiresAt)
   });
 });
 
-// URL de autorização do Bling
 app.get('/auth/url', (req, res) => {
-  const url = `https://www.bling.com.br/Api/v3/oauth/authorize?response_type=code&client_id=${CLIENT_ID}&state=mrshelby`;
-  res.json({ url });
+  res.json({
+    url: `https://www.bling.com.br/Api/v3/oauth/authorize?response_type=code&client_id=${CLIENT_ID}&state=mrshelby`
+  });
 });
 
 // ─── ROTAS DE DADOS ───────────────────────────────────────────────────
-
 app.get('/produtos', async (req, res) => {
   try {
-    const { limite = 100, pagina = 1, situacao = 'A', nome = '' } = req.query;
+    const { limite=100, pagina=1, situacao='A', nome='' } = req.query;
     let endpoint = `produtos?limite=${limite}&pagina=${pagina}&situacao=${situacao}`;
     if (nome) endpoint += `&nome=${encodeURIComponent(nome)}`;
-    const data = await blingGet(endpoint);
-    res.json(data);
+    res.json(await blingGet(endpoint));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/pedidos', async (req, res) => {
   try {
-    const { limite = 50, pagina = 1, situacao = '', dataInicial = '', dataFinal = '' } = req.query;
+    const { limite=50, pagina=1, situacao='', dataInicial='', dataFinal='' } = req.query;
     let endpoint = `pedidos/vendas?limite=${limite}&pagina=${pagina}`;
     if (situacao)    endpoint += `&situacoes[]=${situacao}`;
     if (dataInicial) endpoint += `&dataInicial=${dataInicial}`;
     if (dataFinal)   endpoint += `&dataFinal=${dataFinal}`;
-    const data = await blingGet(endpoint);
-    res.json(data);
+    res.json(await blingGet(endpoint));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/estoque', async (req, res) => {
   try {
-    const { limite = 100, pagina = 1 } = req.query;
-    const data = await blingGet(`estoques?limite=${limite}&pagina=${pagina}`);
-    res.json(data);
+    const { limite=100, pagina=1 } = req.query;
+    res.json(await blingGet(`estoques?limite=${limite}&pagina=${pagina}`));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/financeiro/receber', async (req, res) => {
   try {
-    const { limite = 50, situacao = '' } = req.query;
+    const { limite=50, situacao='' } = req.query;
     let endpoint = `contas/receber?limite=${limite}`;
     if (situacao) endpoint += `&situacoes[]=${situacao}`;
-    const data = await blingGet(endpoint);
-    res.json(data);
+    res.json(await blingGet(endpoint));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/financeiro/pagar', async (req, res) => {
   try {
-    const { limite = 50 } = req.query;
-    const data = await blingGet(`contas/pagar?limite=${limite}`);
-    res.json(data);
+    const { limite=50 } = req.query;
+    res.json(await blingGet(`contas/pagar?limite=${limite}`));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/nfe', async (req, res) => {
   try {
-    const { limite = 50 } = req.query;
-    const data = await blingGet(`nfe?limite=${limite}`);
-    res.json(data);
+    const { limite=50 } = req.query;
+    res.json(await blingGet(`nfe?limite=${limite}`));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Endpoint agregado — busca tudo de uma vez para o dashboard
 app.get('/dashboard', async (req, res) => {
   try {
     const hoje = new Date().toISOString().split('T')[0];
@@ -199,29 +231,69 @@ app.get('/dashboard', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Endpoint para criar pedido de compra
 app.post('/pedidos/compra', async (req, res) => {
   try {
     const token = await getValidToken();
     const resp = await fetch(`${BLING_BASE}/pedidos/compras`, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body)
     });
-    const data = await resp.json();
-    res.json(data);
+    res.json(await resp.json());
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Health check
+// ─── ROTA CHAT IA ─────────────────────────────────────────────────────
+app.post('/chat', async (req, res) => {
+  const { pergunta, dados, historico = [] } = req.body;
+  if (!pergunta) return res.status(400).json({ error: 'pergunta obrigatória' });
+
+  try {
+    const sistema = `Você é o assistente de gestão da MR. Shelby, empresa brasileira de e-commerce especializada em bonés e acessórios.
+Você tem acesso aos dados em tempo real do Bling ERP da empresa.
+
+DADOS ATUAIS DO BLING:
+${JSON.stringify(dados, null, 2)}
+
+INSTRUÇÕES:
+- Responda em português brasileiro, de forma objetiva e direta
+- Use os dados reais fornecidos para responder
+- Quando mostrar listas de produtos/pedidos, use formato de tabela markdown
+- Identifique alertas importantes (estoque crítico, pedidos atrasados, vencimentos)
+- Quando sugerido reposição de estoque, calcule quantidades baseado no histórico
+- Para pedidos de compra, formate claramente com produto, quantidade e justificativa
+- Seja proativo: além de responder, aponte oportunidades ou riscos
+- Valores monetários em R$ formato brasileiro`;
+
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY || '',
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1500,
+        system: sistema,
+        messages: [...historico, { role: 'user', content: pergunta }]
+      })
+    });
+
+    const d = await r.json();
+    res.json({ resposta: d.content?.[0]?.text || 'Não foi possível obter resposta.' });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── HEALTH CHECK ─────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
     app: 'MR. Shelby × Bling API',
     connected: !!tokenState.accessToken,
+    token_valid: !!(tokenState.accessToken && Date.now() < tokenState.expiresAt),
     uptime: Math.floor(process.uptime()) + 's'
   });
 });
