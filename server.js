@@ -310,3 +310,9 @@ app.get('/', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`[Server] MR. Shelby × Bling rodando na porta ${PORT}`));
+
+// Rota para expor o token atual (uso interno do Claude)
+app.get('/auth/token', (req, res) => {
+  if (!tokenState.accessToken) return res.status(401).json({ error: 'Não autenticado' });
+  res.json({ access_token: tokenState.accessToken });
+});
